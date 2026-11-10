@@ -1,0 +1,58 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js v22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm v10
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Java JDK 21 for Android Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install project dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build pure Vite web frontend (bypassing Electron packager)
+        run: |
+          # Build only the React renderer into dist/
+          pnpm exec vite build --outDir dist
+
+      - name: Wrap frontend with Capacitor for Android
+        run: |
+          pnpm add -D @capacitor/cli
+          pnpm add @capacitor/core @capacitor/android
+          npx cap init "Liner" "fun.tryliner.mobile" --web-dir dist
+          npx cap add android
+          npx cap copy android
+
+      - name: Compile Debug APK with Gradle
+        working-directory: ./android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload Finished APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Liner-Android-Debug-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
