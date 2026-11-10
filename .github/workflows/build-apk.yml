@@ -1,4 +1,4 @@
-name: Build Android APK
+8name: Build Android APK
 
 on:
   workflow_dispatch:
@@ -135,3 +135,36 @@ jobs:
         with:
           name: Liner-Android-Debug-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
+                - name: Inspect Electron bridge requirements
+        shell: bash
+        run: |
+          echo "===== ELECTRON PRELOAD ====="
+          if [ -f electron/preload.ts ]; then
+            sed -n '1,280p' electron/preload.ts
+          fi
+
+          echo ""
+          echo "===== FIND ELECTRON WARNING ====="
+          grep -RniE \
+            --include='*.ts' \
+            --include='*.tsx' \
+            --include='*.js' \
+            --include='*.json' \
+            -C 15 \
+            'should run inside Electron|need the desktop bridge|deeplinks' \
+            src electron || true
+
+          echo ""
+          echo "===== FIND BRIDGE CHECKS ====="
+          grep -RniE \
+            --include='*.ts' \
+            --include='*.tsx' \
+            -C 5 \
+            'contextBridge|exposeInMainWorld|isElectron|!!window\.|typeof window\.' \
+            src electron | head -n 350 || true
+
+          echo ""
+          echo "===== HTML ENTRY ====="
+          if [ -f index.html ]; then
+            sed -n '1,180p' index.html
+          fi
