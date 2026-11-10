@@ -32,355 +32,81 @@ jobs:
       - name: Install project dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Patch CSP, Vite Config, Wasm Signer & Universal Android Bridge
+      - name: Create Universal Android Bridge & Fix Configs
         run: |
-          cat << 'EOF' > patch-android.mjs
-          import fs from 'node:fs';
-          import path from 'node:path';
-
-          // 1. Inspect electron/preload.ts to log exact structure in GitHub Actions logs
-          const preloadPath = 'electron/preload.ts';
-          const preloadSrc = fs.existsSync(preloadPath) ? fs.readFileSync(preloadPath, 'utf8') : '';
-          console.log('=== electron/preload.ts ===\n', preloadSrc);
-
-          // 2. Disable strict Content Security Policy in vite.csp.ts & index.html
-          if (fs.existsSync('vite.csp.ts')) {
-            let cspCode = fs.readFileSync('vite.csp.ts', 'utf8');
-            console.log('=== vite.csp.ts ===\n', cspCode);
-            // Replace any CSP meta tag injection in vite.csp.ts with a no-op plugin
-            cspCode = cspCode.replace(/transformIndexHtml[\s\S]*?(?=\n\s*\}[,\n])/g, 'transformIndexHtml(html) { return html; }');
-            fs.writeFileSync('vite.csp.ts', cspCode, 'utf8');
-          }
-
-          // 3. Collect all bridge names exposed in preload.ts or referenced on window.*
-          const bridgeNames = new Set(['electron', 'liner', 'api', 'desktop', 'bridge', 'electronAPI', 'desktopBridge', 'ipcRenderer']);
-          for (const m of preloadSrc.matchAll(/exposeInMainWorld\(\s*['"]([^'"]+)['"]/g)) {
-            bridgeNames.add(m[1]);
-          }
-
-          function walk(dir) {
-            let results = [];
-            if (!fs.existsSync(dir)) return results;
-            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-              const full = path.join(dir, entry.name);
-              if (entry.isDirectory()) results = results.concat(walk(full));
-              else if (/\.(ts|tsx|js|jsx)$/.test(entry.name)) results.push(full);
-            }
-            return results;
-          }
-
-          for (const file of walk('src')) {
-            const content = fs.readFileSync(file, 'utf8');
-            for (const m of content.matchAll(/\bwindow\.([a-zA-Z_$][a-zA-Z0-9_$]*)/g)) {
-              const prop = m[1];
-              if (!['addEventListener', 'removeEventListener', 'location', 'localStorage', 'sessionStorage', 'navigator', 'document', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'matchMedia', 'innerWidth', 'innerHeight', 'open', 'close', 'fetch', 'crypto', 'performance', 'history', 'CustomEvent', 'Event', 'dispatchEvent', 'devicePixelRatio', 'getComputedStyle', 'scrollTo', ' eval', 'parent', 'top', 'self', 'frames', 'URL', 'URLSearchParams', 'Audio', 'Image', 'WebSocket', 'Worker', 'Blob'].includes(prop)) {
-                bridgeNames.add(prop);
-              }
-            }
-          }
-
-          // 4. Write Universal Hybrid Bridge + On-Screen Diagnostic Overlay
-          fs.mkdirSync('public', { recursive: true });
-          const bridgeJs = `
-          (function() {
-            window.__linerErrors = [];
-            function showDiag(msg) {
-              console.error('[Liner-Android]', msg);
-              window.__linerErrors.push(msg);
-              var updateBox = function() {
-                if (!document.body) return;
-                var box = document.getElementById('__liner_diag_box');
-                if (!box) {
-                  box = document.createElement('div');
-                  box.id = '__liner_diag_box';
-                  box.style.cssText = 'position:fixed;bottom:10px;left:10px;right:10px;max-height:42vh;overflow:auto;background:rgba(20,20,28,0.95);color:#ff6b6b;font:12px/1.4 monospace;padding:10px;border:1px solid #ff6b6b;border-radius:8px;z-index:2147483647;white-space:pre-wrap;word-break:break-word;box-shadow:0 8px 32px rgba(0,0,0,0.6);';
-                  var closeBtn = document.createElement('button');
-                  closeBtn.textContent = 'Hide Errors (✕)';
-                  closeBtn.style.cssText = 'float:right;background:#333;color:#fff;border:none;padding:3px 8px;border-radius:4px;font-size:11px;margin-bottom:6px;';
-                  closeBtn.onclick = function() { box.style.display = 'none'; };
-                  box.appendChild(closeBtn);
-                  var content = document.createElement('div');
-                  content.id = '__liner_diag_content';
-                  box.appendChild(content);
-                  document.body.appendChild(box);
-                }
-                var c = document.getElementById('__liner_diag_content');
-                if (c) c.textContent = window.__linerErrors.join('\\n----------------\\n');
-              };
-              if (document.body) updateBox();
-              else window.addEventListener('DOMContentLoaded', updateBox);
-            }
-
-            window.addEventListener('error', function(e) {
-              showDiag('Error: ' + (e.message || e) + (e.filename ? ' (' + e.filename.split('/').pop() + ':' + e.lineno + ')' : '') + (e.error && e.error.stack ? '\\n' + e.error.stack : ''));
-            });
-            window.addEventListener('unhandledrejection', function(e) {
-              var r = e.reason;
-              showDiag('Unhandled Promise: ' + (r && r.stack ? r.stack : (r && r.message ? r.message : JSON.stringify(r))));
-            });
-
-            // Ensure dark background instead of transparent void
-            document.addEventListener('DOMContentLoaded', function() {
-              document.documentElement.style.backgroundColor = '#0b0b0f';
-              document.body.style.backgroundColor = '#0b0b0f';
-              document.body.style.minHeight = '100vh';
-            });
-
-            try {
-              Object.defineProperty(navigator, 'userAgent', {
-                get: function() { return 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0.0.0 Electron/44.0.0 Mobile Safari/537.36'; },
-                configurable: true
-              });
-            } catch (e) {}
-
-            window.process = window.process || {
-              platform: 'linux',
-              arch: 'arm64',
-              type: 'renderer',
-              env: { NODE_ENV: 'production' },
-              versions: { electron: '44.0.0', chrome: '126.0.0.0', node: '22.0.0' }
-            };
-
-            function computeSyncResult(path, args) {
-              var lower = (path || '').toLowerCase();
-
-              // Event listeners / subscriptions return an unsubscribe function
-              if (typeof args[0] === 'function' || typeof args[1] === 'function' || /(^|\\.)(on[A-Z]|subscribe|listen|addlistener|once)/i.test(path)) {
-                var unsub = function() {};
-                unsub.dispose = function() {};
-                unsub.remove = function() {};
-                return unsub;
-              }
-
-              // Request signer (Rust/Wasm)
-              if (lower.includes('sign') && window.__linerRealSigner) {
-                try {
-                  for (var k in window.__linerRealSigner) {
-                    if (typeof window.__linerRealSigner[k] === 'function') {
-                      return window.__linerRealSigner[k].apply(null, args);
-                    }
-                  }
-                } catch (e) {
-                  console.warn('Signer invocation error:', e);
-                }
-              }
-
-              // Booleans for offline / window state
-              if (lower.includes('isoffline') || lower.endsWith('.offline') || lower.includes('minimized') || lower.includes('maximized') || lower.includes('fullscreen')) {
-                return false;
-              }
-              if (lower.includes('isonline') || lower.endsWith('.online') || lower.includes('iselectron') || lower.includes('supported') || lower.includes('available')) {
-                return true;
-              }
-
-              // Network / connectivity probe
-              if (lower.includes('offline') || lower.includes('network') || lower.includes('probe') || lower.includes('connectivity') || lower.includes('check') || lower.includes('status') || lower.includes('health')) {
-                return {
-                  ok: true,
-                  online: true,
-                  offline: false,
-                  isOffline: false,
-                  isOnline: true,
-                  youtube: true,
-                  youtubeReachable: true,
-                  liner: true,
-                  linerReachable: true,
-                  api: true,
-                  country: 'CA',
-                  status: 'online',
-                  code: 200
-                };
-              }
-
-              // Collections / lists (local tracks, downloads, cache, playlists, devices)
-              if (lower.includes('list') || lower.includes('tracks') || lower.includes('files') || lower.includes('items') || lower.includes('downloads') || lower.includes('cached') || lower.includes('history') || lower.includes('queues') || lower.includes('folders') || lower.includes('dirs')) {
-                return [];
-              }
-
-              // Storage / cache stats
-              if (lower.includes('usage') || lower.includes('stats') || lower.includes('size') || lower.includes('info') || lower.includes('quota')) {
-                return { size: 0, total: 0, used: 0, cache: 0, downloads: 0, count: 0, path: '/storage/emulated/0/Liner' };
-              }
-
-              // Persistent key-value storage
-              if (lower.includes('set') || lower.includes('save') || lower.includes('write') || lower.includes('put')) {
-                try {
-                  var sKey = args.length > 1 ? String(args[0]) : path;
-                  var sVal = args.length > 1 ? args[1] : args[0];
-                  localStorage.setItem('__liner_kv_' + sKey, JSON.stringify(sVal));
-                } catch (e) {}
-                return true;
-              }
-              if (lower.includes('get') || lower.includes('read') || lower.includes('load') || lower.includes('token') || lower.includes('session')) {
-                try {
-                  var gKey = args.length > 0 && typeof args[0] === 'string' ? args[0] : path;
-                  var raw = localStorage.getItem('__liner_kv_' + gKey);
-                  if (raw !== null) return JSON.parse(raw);
-                } catch (e) {}
-                return null;
-              }
-              if (lower.includes('delete') || lower.includes('remove') || lower.includes('clear')) {
-                try {
-                  var dKey = args.length > 0 && typeof args[0] === 'string' ? args[0] : path;
-                  localStorage.removeItem('__liner_kv_' + dKey);
-                } catch (e) {}
-                return true;
-              }
-
-              // External URLs / sharing
-              if (lower.includes('openexternal') || lower.includes('openurl')) {
-                if (args[0]) window.open(String(args[0]), '_blank');
-                return true;
-              }
-              if (lower.includes('share') || lower.includes('copy') || lower.includes('clipboard')) {
-                if (navigator.clipboard && args[0]) {
-                  navigator.clipboard.writeText(typeof args[0] === 'string' ? args[0] : JSON.stringify(args[0])).catch(function(){});
-                }
-                return true;
-              }
-
-              return {};
-            }
-
-            // Hybrid node that acts as a Function, Object, Array, and Promise simultaneously
-            function createNode(path, depth) {
-              if (depth > 8) return function() {};
-              var fn = function() {};
-              return new Proxy(fn, {
-                has: function() { return true; },
-                get: function(target, prop) {
-                  if (prop === Symbol.toPrimitive) return function(hint) { return hint === 'number' ? 0 : ''; };
-                  if (prop === Symbol.iterator) return function*() {};
-                  if (prop === '__esModule') return true;
-                  if (prop === 'then') return undefined; // Node itself is not a Promise unless invoked
-
-                  var s = String(prop);
-                  if (s === 'platform') return 'linux';
-                  if (s === 'arch') return 'arm64';
-                  if (s === 'version' || s === 'appVersion') return '0.1.40';
-                  if (s === 'isElectron' || s === 'isDesktop' || s === 'online' || s === 'isOnline' || s === 'ok' || s === 'available' || s === 'supported') return true;
-                  if (s === 'offline' || s === 'isOffline' || s === 'isMaximized' || s === 'isMinimized' || s === 'isFullScreen') return false;
-                  if (s === 'length' || s === 'size' || s === 'count') return 0;
-
-                  // Safe Array prototype methods if code treats a property as an array
-                  if (['map', 'filter', 'slice', 'concat', 'flatMap'].includes(s)) return function() { return []; };
-                  if (['forEach', 'push', 'unshift', 'splice', 'sort'].includes(s)) return function() {};
-                  if (['find', 'findIndex', 'some', 'every', 'includes'].includes(s)) return function() { return s === 'findIndex' ? -1 : (s === 'every' ? true : false); };
-                  if (s === 'reduce') return function(cb, init) { return init !== undefined ? init : []; };
-
-                  var nextPath = path ? path + '.' + s : s;
-                  return createNode(nextPath, depth + 1);
-                },
-                apply: function(target, thisArg, args) {
-                  var res = computeSyncResult(path, args || []);
-                  // If result is already a Promise (e.g. async Wasm signer), return it directly
-                  if (res && typeof res.then === 'function') return res;
-
-                  // Otherwise return a Thenable Hybrid so both sync callers and "await" callers succeed
-                  if (res === null || typeof res !== 'object') {
-                    var p = Promise.resolve(res);
-                    return p;
-                  }
-                  var resolvedPromise = Promise.resolve(res);
-                  return new Proxy(res, {
-                    get: function(t, pProp) {
-                      if (pProp === 'then') return resolvedPromise.then.bind(resolvedPromise);
-                      if (pProp === 'catch') return resolvedPromise.catch.bind(resolvedPromise);
-                      if (pProp === 'finally') return resolvedPromise.finally.bind(resolvedPromise);
-                      if (pProp in t) {
-                        var v = t[pProp];
-                        return typeof v === 'function' ? v.bind(t) : v;
-                      }
-                      if (pProp === Symbol.iterator) return Array.isArray(t) ? t[Symbol.iterator].bind(t) : function*() {};
-                      if (['map', 'filter', 'forEach', 'slice'].includes(String(pProp))) return [][pProp].bind([]);
-                      return undefined;
-                    }
-                  });
-                }
-              });
-            }
-
-            var rootBridge = createNode('', 0);
-            var names = ${JSON.stringify([...bridgeNames])};
-            for (var i = 0; i < names.length; i++) {
-              try {
-                window[names[i]] = rootBridge;
-              } catch (e) {}
-            }
-          })();
-          `;
-
-          fs.writeFileSync('public/android-bridge.js', bridgeJs, 'utf8');
-
-          // 5. Patch index.html: strip CSP <meta> tags and inject /android-bridge.js
-          if (fs.existsSync('index.html')) {
-            let html = fs.readFileSync('index.html', 'utf8');
-            html = html.replace(/<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
-            if (!html.includes('android-bridge.js')) {
-              html = html.replace('<head>', '<head>\n    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />\n    <script src="/android-bridge.js"></script>');
-            }
-            fs.writeFileSync('index.html', html, 'utf8');
-          }
-
-          // 6. Patch vite.config.ts to disable electron build plugins and CSP plugins during web build
-          if (fs.existsSync('vite.config.ts')) {
-            let viteCfg = fs.readFileSync('vite.config.ts', 'utf8');
-            console.log('=== vite.config.ts ===\n', viteCfg);
-            // Make base relative so Capacitor WebView always resolves assets properly
-            if (!viteCfg.includes('base:')) {
-              viteCfg = viteCfg.replace('defineConfig({', 'defineConfig({\n  base: "./",');
-              fs.writeFileSync('vite.config.ts', viteCfg, 'utf8');
-            }
-          }
-
-          // 7. Wire electron/signer.ts Wasm module into the renderer safely
-          if (fs.existsSync('electron/signer.ts') && fs.existsSync('src/main.tsx')) {
-            let signerCode = fs.readFileSync('electron/signer.ts', 'utf8');
-            const bufferShim = [
-              'const __BufferShim = {',
-              '  from: (input: any, enc?: string) => {',
-              '    if (typeof input === "string" && enc === "base64") {',
-              '      const bin = atob(input);',
-              '      const out = new Uint8Array(bin.length);',
-              '      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);',
-              '      return out;',
-              '    }',
-              '    if (typeof input === "string") return new TextEncoder().encode(input);',
-              '    return new Uint8Array(input);',
-              '  }',
-              '};',
-              'const Buffer: any = (globalThis as any).Buffer || __BufferShim;'
-            ].join('\n');
-            signerCode = signerCode.replace(/import\s+.*from\s+['"](?:electron|node:[^'"]+|fs|path)['"];?/g, '');
-            fs.writeFileSync('src/android-signer.ts', bufferShim + '\n' + signerCode, 'utf8');
-            fs.writeFileSync('src/android-signer-init.ts', 'import * as signer from "./android-signer";\n(window as any).__linerRealSigner = signer;\n', 'utf8');
-            const mainTsx = fs.readFileSync('src/main.tsx', 'utf8');
-            if (!mainTsx.includes('android-signer-init')) {
-              fs.writeFileSync('src/main.tsx', 'import "./android-signer-init";\n' + mainTsx, 'utf8');
-            }
-          }
-          EOF
-          node patch-android.mjs
-
-      - name: Build Vite web frontend
-        run: |
-          pnpm exec vite build --base=./ --outDir dist || (
-            echo "Fallback: building without direct signer import..."
-            git checkout src/main.tsx
-            pnpm exec vite build --base=./ --outDir dist
-          )
-          # Strip any CSP meta tags that vite.csp.ts may have injected into dist/index.html
           node -e '
             const fs = require("fs");
-            if (fs.existsSync("dist/index.html")) {
-              let h = fs.readFileSync("dist/index.html", "utf8");
-              h = h.replace(/<meta[^>]*http-equiv=["\x27]Content-Security-Policy["\x27][^>]*>/gi, "");
-              fs.writeFileSync("dist/index.html", h, "utf8");
-              console.log("=== Final dist/index.html ===\n", h);
+
+            // 1. Create a bulletproof universal bridge script
+            const bridgeCode = `
+            (function() {
+              window.process = window.process || {
+                platform: "linux",
+                arch: "arm64",
+                type: "renderer",
+                env: { NODE_ENV: "production" },
+                versions: { electron: "44.0.0", chrome: "126.0.0.0", node: "22.0.0" }
+              };
+
+              function createProxy(path) {
+                var target = function() {};
+                return new Proxy(target, {
+                  has: function() { return true; },
+                  get: function(t, p) {
+                    if (p === Symbol.toPrimitive) return function() { return ""; };
+                    if (p === "then") return undefined;
+                    if (p === "__esModule") return true;
+                    var s = String(p);
+                    if (s === "platform") return "linux";
+                    if (s === "isElectron" || s === "isDesktop" || s === "online" || s === "isOnline" || s === "ok" || s === "available" || s === "supported") return true;
+                    if (s === "offline" || s === "isOffline" || s === "isMaximized" || s === "isMinimized") return false;
+                    if (["map", "filter", "slice", "concat", "forEach"].includes(s)) return function() { return []; };
+                    return createProxy(path ? path + "." + s : s);
+                  },
+                  apply: function(t, thisArg, args) {
+                    var lower = (path || "").toLowerCase();
+                    if (lower.includes("offline")) return Promise.resolve(false);
+                    if (lower.includes("online") || lower.includes("status") || lower.includes("health")) return Promise.resolve({ ok: true, online: true });
+                    if (lower.includes("get") || lower.includes("load")) return Promise.resolve(null);
+                    return Promise.resolve(true);
+                  }
+                });
+              }
+
+              var universal = createProxy("");
+              ["electron", "electronAPI", "api", "desktop", "bridge", "ipcRenderer", "liner"].forEach(function(name) {
+                try { window[name] = universal; } catch(e) {}
+              });
+            })();
+            `;
+            fs.mkdirSync("public", { recursive: true });
+            fs.writeFileSync("public/android-bridge.js", bridgeCode, "utf8");
+
+            // 2. Inject bridge into index.html
+            if (fs.existsSync("index.html")) {
+              let html = fs.readFileSync("index.html", "utf8");
+              html = html.replace(/<meta[^>]*http-equiv=["\x27]Content-Security-Policy["\x27][^>]*>/gi, "");
+              if (!html.includes("android-bridge.js")) {
+                html = html.replace("<head>", "<head>\n    <script src=\"./android-bridge.js\"></script>");
+              }
+              fs.writeFileSync("index.html", html, "utf8");
             }
+
+            // 3. Ensure base relative in vite.config.ts
+            if (fs.existsSync("vite.config.ts")) {
+              let v = fs.readFileSync("vite.config.ts", "utf8");
+              if (!v.includes("base:")) {
+                v = v.replace("defineConfig({", "defineConfig({\n  base: \"./\",");
+                fs.writeFileSync("vite.config.ts", v, "utf8");
+              }
+            }
+          console.log("Android patch applied successfully!");
           '
 
-      - name: Wrap frontend with Capacitor & enable Native HTTP
+      - name: Build Vite web frontend
+        run: pnpm exec vite build --base=./ --outDir dist
+
+      - name: Wrap frontend with Capacitor & Build APK
         run: |
           pnpm add -D @capacitor/cli
           pnpm add @capacitor/core @capacitor/android
@@ -392,30 +118,11 @@ jobs:
             "webDir": "dist",
             "server": {
               "androidScheme": "https"
-            },
-            "plugins": {
-              "CapacitorHttp": {
-                "enabled": true
-              }
             }
           }
           EOF
           npx cap add android
           npx cap copy android
-
-      - name: Enable Cleartext & WebView Debugging in AndroidManifest.xml
-        run: |
-          node -e '
-            const fs = require("fs");
-            const p = "android/app/src/main/AndroidManifest.xml";
-            if (fs.existsSync(p)) {
-              let xml = fs.readFileSync(p, "utf8");
-              if (!xml.includes("usesCleartextTraffic")) {
-                xml = xml.replace("<application", "<application android:usesCleartextTraffic=\"true\"");
-                fs.writeFileSync(p, xml, "utf8");
-              }
-            }
-          '
 
       - name: Compile Debug APK with Gradle
         working-directory: ./android
