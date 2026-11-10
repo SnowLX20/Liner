@@ -32,16 +32,235 @@ jobs:
       - name: Install project dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Build pure Vite web frontend (bypassing Electron packager)
+      - name: Inject Android Desktop Bridge & Wasm Signer Polyfill
         run: |
-          # Build only the React renderer into dist/
-          pnpm exec vite build --outDir dist
+          cat << 'EOF' > patch-android.mjs
+          import fs from 'node:fs';
+          import path from 'node:path';
 
-      - name: Wrap frontend with Capacitor for Android
+          const preloadPath = 'electron/preload.ts';
+          const preloadSrc = fs.existsSync(preloadPath) ? fs.readFileSync(preloadPath, 'utf8') : '';
+
+          // 1. Discover all exposed bridge names in electron/preload.ts and src/
+          const bridgeNames = new Set(['electron', 'liner', 'api', 'desktop', 'bridge', 'electronAPI', 'desktopBridge']);
+          for (const m of preloadSrc.matchAll(/exposeInMainWorld\(\s*['"]([^'"]+)['"]/g)) {
+            bridgeNames.add(m[1]);
+          }
+
+          const objectKeys = new Set(['deeplinks', 'offline', 'sharing', 'window', 'auth', 'storage', 'signer', 'localTracks', 'updater', 'ipcRenderer', 'net', 'session', 'system', 'media', 'app']);
+          for (const m of preloadSrc.matchAll(/([a-zA-Z0-9_$]+)\s*:\s*\{/g)) {
+            objectKeys.add(m[1]);
+          }
+
+          const allPreloadIdentifiers = new Set();
+          for (const m of preloadSrc.matchAll(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\b/g)) {
+            allPreloadIdentifiers.add(m[1]);
+          }
+
+          function walk(dir) {
+            let results = [];
+            if (!fs.existsSync(dir)) return results;
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) results = results.concat(walk(full));
+              else if (/\.(ts|tsx|js|jsx|json)$/.test(entry.name)) results.push(full);
+            }
+            return results;
+          }
+
+          const srcFiles = walk('src');
+          for (const file of srcFiles) {
+            const content = fs.readFileSync(file, 'utf8');
+            for (const m of content.matchAll(/\bwindow\.([a-zA-Z_$][a-zA-Z0-9_$]*)/g)) {
+              const prop = m[1];
+              if (!['addEventListener', 'removeEventListener', 'location', 'localStorage', 'sessionStorage', 'navigator', 'document', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame', 'matchMedia', 'innerWidth', 'innerHeight', 'open', 'close', 'fetch', 'crypto', 'performance', 'history', 'CustomEvent', 'Event', ' dispatchEvent', 'devicePixelRatio', 'getComputedStyle', 'scrollTo'].includes(prop)) {
+                bridgeNames.add(prop);
+              }
+            }
+            if (content.includes('App should run inside Electron') || content.includes('need the desktop bridge')) {
+              console.log('Found desktop bridge guard in:', file);
+            }
+          }
+
+          console.log('Discovered bridge names:', [...bridgeNames]);
+
+          // 2. Generate public/android-bridge.js to run in <head> before any module loads
+          fs.mkdirSync('public', { recursive: true });
+          const bridgeScript = [
+            '(function() {',
+            '  try {',
+            '    Object.defineProperty(navigator, "userAgent", {',
+            '      get: function() { return "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Electron/44.0.0 Mobile Safari/537.36"; },',
+            '      configurable: true',
+            '    });',
+            '  } catch (e) {}',
+            '  window.process = window.process || {',
+            '    platform: "linux",',
+            '    arch: "arm64",',
+            '    type: "renderer",',
+            '    env: { NODE_ENV: "production" },',
+            '    versions: { electron: "44.0.0", chrome: "124.0.0.0", node: "22.0.0" }',
+            '  };',
+            '  var objKeys = new Set(' + JSON.stringify([...objectKeys]) + ');',
+            '  var knownIds = ' + JSON.stringify([...allPreloadIdentifiers]) + ';',
+            '  function handleCall(path, args) {',
+            '    var lower = path.toLowerCase();',
+            '    if (typeof args[0] === "function" || typeof args[1] === "function" || /(^|\\.)(on[A-Z]|subscribe|listen|addlistener)/i.test(path)) {',
+            '      var unsub = function() {};',
+            '      unsub.then = function(r) { return Promise.resolve(unsub).then(r); };',
+            '      return unsub;',
+            '    }',
+            '    if (lower.includes("sign") && window.__linerRealSigner) {',
+            '      try {',
+            '        for (var k in window.__linerRealSigner) {',
+            '          if (typeof window.__linerRealSigner[k] === "function") {',
+            '            return Promise.resolve(window.__linerRealSigner[k].apply(null, args));',
+            '          }',
+            '        }',
+            '      } catch (e) { console.warn("Signer call error:", e); }',
+            '    }',
+            '    if (lower.includes("isoffline") || lower.endsWith(".offline")) return Promise.resolve(false);',
+            '    if (lower.includes("isonline") || lower.endsWith(".online")) return Promise.resolve(true);',
+            '    if (lower.includes("offline") || lower.includes("network") || lower.includes("probe") || lower.includes("connectivity") || lower.includes("status")) {',
+            '      return Promise.resolve({ ok: true, online: true, offline: false, isOffline: false, isOnline: true, youtube: true, liner: true, country: "CA", status: 200 });',
+            '    }',
+            '    if (lower.includes("openexternal") || lower.includes("openurl")) {',
+            '      if (args[0]) window.open(String(args[0]), "_blank");',
+            '      return Promise.resolve(true);',
+            '    }',
+            '    if (lower.includes("share") || lower.includes("copy") || lower.includes("clipboard")) {',
+            '      if (navigator.clipboard && args[0]) navigator.clipboard.writeText(typeof args[0] === "string" ? args[0] : JSON.stringify(args[0])).catch(function(){});',
+            '      return Promise.resolve(true);',
+            '    }',
+            '    if (lower.includes("set") || lower.includes("save") || lower.includes("write") || lower.includes("store")) {',
+            '      try {',
+            '        var key = args.length > 1 ? String(args[0]) : path;',
+            '        var val = args.length > 1 ? args[1] : args[0];',
+            '        localStorage.setItem("__liner_bridge_" + key, JSON.stringify(val));',
+            '      } catch (e) {}',
+            '      return Promise.resolve(true);',
+            '    }',
+            '    if (lower.includes("get") || lower.includes("read") || lower.includes("load") || lower.includes("session") || lower.includes("token") || lower.includes("secret")) {',
+            '      try {',
+            '        var gKey = args.length > 0 && typeof args[0] === "string" ? args[0] : path;',
+            '        var raw = localStorage.getItem("__liner_bridge_" + gKey);',
+            '        if (raw !== null) return Promise.resolve(JSON.parse(raw));',
+            '      } catch (e) {}',
+            '      return Promise.resolve(null);',
+            '    }',
+            '    if (lower.includes("delete") || lower.includes("remove") || lower.includes("clear")) {',
+            '      try {',
+            '        var dKey = args.length > 0 && typeof args[0] === "string" ? args[0] : path;',
+            '        localStorage.removeItem("__liner_bridge_" + dKey);',
+            '      } catch (e) {}',
+            '      return Promise.resolve(true);',
+            '    }',
+            '    if (lower.includes("maximized") || lower.includes("fullscreen") || lower.includes("minimized")) return Promise.resolve(false);',
+            '    return Promise.resolve(null);',
+            '  }',
+            '  function makeProxy(path, isObj) {',
+            '    var base = isObj ? {} : function() {};',
+            '    if (isObj) {',
+            '      for (var i = 0; i < knownIds.length; i++) {',
+            '        try { base[knownIds[i]] = true; } catch (e) {}',
+            '      }',
+            '    }',
+            '    return new Proxy(base, {',
+            '      has: function() { return true; },',
+            '      get: function(target, prop) {',
+            '        if (prop === Symbol.toPrimitive) return function() { return true; };',
+            '        if (prop === "then") return undefined;',
+            '        if (prop === "__esModule") return true;',
+            '        var s = String(prop);',
+            '        if (s === "platform") return "linux";',
+            '        if (s === "arch") return "arm64";',
+            '        if (s === "version" || s === "appVersion") return "0.1.40";',
+            '        if (s === "isElectron" || s === "isDesktop" || s === "isSupported" || s === "available" || s === "online" || s === "isOnline") return true;',
+            '        if (s === "offline" || s === "isOffline") return false;',
+            '        var nextPath = path ? path + "." + s : s;',
+            '        return makeProxy(nextPath, objKeys.has(s));',
+            '      },',
+            '      apply: function(target, thisArg, args) {',
+            '        return handleCall(path, args || []);',
+            '      }',
+            '    });',
+            '  }',
+            '  var rootBridge = makeProxy("", true);',
+            '  var names = ' + JSON.stringify([...bridgeNames]) + ';',
+            '  for (var i = 0; i < names.length; i++) {',
+            '    try { window[names[i]] = rootBridge; } catch (e) {}',
+            '  }',
+            '})();'
+          ].join('\n');
+
+          fs.writeFileSync('public/android-bridge.js', bridgeScript, 'utf8');
+
+          // 3. Inject <script src="/android-bridge.js"></script> at top of <head> in index.html
+          if (fs.existsSync('index.html')) {
+            let html = fs.readFileSync('index.html', 'utf8');
+            if (!html.includes('android-bridge.js')) {
+              html = html.replace('<head>', '<head>\n    <script src="/android-bridge.js"></script>');
+              fs.writeFileSync('index.html', html, 'utf8');
+            }
+          }
+
+          // 4. Bridge electron/signer.ts Wasm request signer into the renderer
+          if (fs.existsSync('electron/signer.ts') && fs.existsSync('src/main.tsx')) {
+            let signerCode = fs.readFileSync('electron/signer.ts', 'utf8');
+            const bufferShim = [
+              'const __BufferShim = {',
+              '  from: (input: any, enc?: string) => {',
+              '    if (typeof input === "string" && enc === "base64") {',
+              '      const bin = atob(input);',
+              '      const out = new Uint8Array(bin.length);',
+              '      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);',
+              '      return out;',
+              '    }',
+              '    if (typeof input === "string") return new TextEncoder().encode(input);',
+              '    return new Uint8Array(input);',
+              '  }',
+              '};',
+              'const Buffer: any = (globalThis as any).Buffer || __BufferShim;'
+            ].join('\n');
+            signerCode = signerCode.replace(/import\s+.*from\s+['"](?:electron|node:[^'"]+|fs|path)['"];?/g, '');
+            fs.writeFileSync('src/android-signer.ts', bufferShim + '\n' + signerCode, 'utf8');
+            fs.writeFileSync('src/android-signer-init.ts', 'import * as signer from "./android-signer";\n(window as any).__linerRealSigner = signer;\n', 'utf8');
+            const mainTsx = fs.readFileSync('src/main.tsx', 'utf8');
+            if (!mainTsx.includes('android-signer-init')) {
+              fs.writeFileSync('src/main.tsx', 'import "./android-signer-init";\n' + mainTsx, 'utf8');
+            }
+          }
+          EOF
+          node patch-android.mjs
+
+      - name: Build Vite web frontend
+        run: |
+          pnpm exec vite build --outDir dist || (
+            echo "Fallback: building without direct signer import..."
+            git checkout src/main.tsx
+            pnpm exec vite build --outDir dist
+          )
+
+      - name: Wrap frontend with Capacitor & enable Native HTTP
         run: |
           pnpm add -D @capacitor/cli
           pnpm add @capacitor/core @capacitor/android
           npx cap init "Liner" "fun.tryliner.mobile" --web-dir dist
+          cat << 'EOF' > capacitor.config.json
+          {
+            "appId": "fun.tryliner.mobile",
+            "appName": "Liner",
+            "webDir": "dist",
+            "server": {
+              "androidScheme": "https"
+            },
+            "plugins": {
+              "CapacitorHttp": {
+                "enabled": true
+              }
+            }
+          }
+          EOF
           npx cap add android
           npx cap copy android
 
